@@ -1,0 +1,7 @@
+discord.py>=2.3.0
+flask>=2.3.0
+asyncio
+threading
+json5
+requests
+python-dotenv
