@@ -116,21 +116,14 @@ def determine_fish_rarity(rare_bonus):
         rates['epic'] = rates.get('epic', 0) + boost_to_epic
         rates['rare'] = rates.get('rare', 0) + boost_to_rare
 
-        # 確保總機率不超過 1，並從 Common 和 Junk 中扣除提升的機率
-        # 這裡的邏輯需要微調以確保總和為 1 且不會出現負機率
-        # 更穩健的做法是重新正規化所有機率
-        # 簡單處理：從 Common 和 Junk 中等比例扣除
-        deduct_sum = boost_to_legendary + boost_to_epic + boost_to_rare
-        if deduct_sum > 0:
-            total_remaining_common_junk = rates.get('common', 0) + rates.get('junk', 0)
-            if total_remaining_common_junk > 0:
-                deduct_from_common = deduct_sum * (rates.get('common', 0) / total_remaining_common_junk)
-                deduct_from_junk = deduct_sum * (rates.get('junk', 0) / total_remaining_common_junk)
+        deductible_amount = (boost_to_legendary + boost_to_epic + boost_to_rare) - (rates['common'] + rates['rare'] + rates['epic'] + rates['legendary'] - sum(game_data['rarity_rates'].values()))
+        if deductible_amount > 0:
+            deduct_from_common = min(rates.get('common', 0), deductible_amount * 0.7)
+            rates['common'] = rates.get('common', 0) - deduct_from_common
+            deductible_amount -= deduct_from_common
 
-                rates['common'] = max(0, rates.get('common', 0) - deduct_from_common)
-                rates['junk'] = max(0, rates.get('junk', 0) - deduct_from_junk)
-            else: # 如果 Common 和 Junk 都為 0，則無法扣除
-                pass # 保持現有機率
+            deduct_from_junk = min(rates.get('junk', 0), deductible_amount)
+            rates['junk'] = rates.get('junk', 0) - deduct_from_junk
 
     for rarity in rates:
         rates[rarity] = max(0, rates[rarity])
@@ -140,7 +133,6 @@ def determine_fish_rarity(rare_bonus):
         for rarity in rates:
             rates[rarity] /= total_sum
     else:
-        # 如果所有機率都為 0，則預設為普通魚
         rates = {'common': 1.0}
 
     rand = random.random()
@@ -151,7 +143,7 @@ def determine_fish_rarity(rare_bonus):
         if rand <= cumulative:
             return rarity
 
-    return 'common' # Fallback in case something goes wrong
+    return 'common'
 
 # --- Discord 機器人事件 ---
 @bot.event
@@ -170,7 +162,7 @@ async def game_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🎣 釣魚遊戲指令", color=0x00ff00)
     commands_text = """
     `/fish` - 開始釣魚
-    `/fish_item` - 切換釣魚道具（魚竿）
+    `/fish_item <魚竿名稱>` - 切換釣魚道具（魚竿），直接輸入名稱
     `/shop` - 查看商店
     `/buy <物品名稱>` - 從商店購買物品
     `/bag` - 查看背包、金錢和釣到的魚
@@ -299,7 +291,7 @@ async def fish_command(interaction: discord.Interaction):
 
     rarity = determine_fish_rarity(rare_bonus)
     if not game_data['fish_data'].get(rarity):
-        rarity = 'common' # Fallback to common if rarity not found
+        rarity = 'common'
     fish_name = random.choice(list(game_data['fish_data'][rarity].keys()))
     fish_info = game_data['fish_data'][rarity][fish_name]
 
@@ -328,86 +320,31 @@ async def fish_command(interaction: discord.Interaction):
 
     await interaction.edit_original_response(embed=result_embed)
 
-@bot.tree.command(name='fish_item', description='切換你的釣魚道具（魚竿）。')
-async def fish_item_command(interaction: discord.Interaction):
+@bot.tree.command(name='fish_item', description='切換你的釣魚道具（魚竿），請直接輸入魚竿名稱。')
+@app_commands.describe(rod_name='要切換的魚竿名稱 (例如：中級魚竿)')
+async def fish_item_command(interaction: discord.Interaction, rod_name: str):
     user_id = str(interaction.user.id)
     user_data = get_user_data(user_id)
 
-    # DEBUG: 檢查原始用戶道具數據
-    print(f"DEBUG: User {user_id} raw items: {user_data['items']}")
+    # 將輸入的魚竿名稱正規化，方便比對 (移除空白、轉小寫)
+    normalized_input_name = rod_name.lower().replace(' ', '')
+    found_rod_key = None
 
-    rods = [item for item in user_data['items'] if '魚竿' in item]
-    # DEBUG: 檢查篩選後的魚竿列表
-    print(f"DEBUG: Filtered rods list: {rods}")
+    # 檢查用戶背包中是否有這個魚竿
+    for item_in_bag in user_data['items'].keys():
+        if item_in_bag.lower().replace(' ', '') == normalized_input_name and '魚竿' in item_in_bag:
+            found_rod_key = item_in_bag
+            break
 
-    if not rods:
-        await interaction.response.send_message("❌ 你沒有任何魚竿可以切換！", ephemeral=True)
-        return
-
-    select_options = []
-    for rod_name in rods:
-        is_current = " (使用中)" if rod_name == user_data['current_rod'] else ""
-        description_text = game_data['items'].get(rod_name, {}).get('description', '')
-        # DEBUG: 檢查每個選項的構成
-        print(f"DEBUG: Creating option for rod '{rod_name}': label='{rod_name}{is_current}', value='{rod_name}', description='{description_text}'")
-
-        select_options.append(
-            discord.SelectOption(label=f"{rod_name}{is_current}", value=rod_name,
-                                 description=description_text)
+    if found_rod_key:
+        user_data['current_rod'] = found_rod_key
+        await interaction.response.send_message(f"✅ 已切換到 **{found_rod_key}**！", ephemeral=False)
+    else:
+        # 如果用戶背包中沒有這個魚竿，或者輸入的不是魚竿
+        await interaction.response.send_message(
+            f"❌ 你沒有名為「**{rod_name}**」的魚竿，或者它不是一個魚竿。請檢查 `/bag` 確認你擁有的魚竿。",
+            ephemeral=True
         )
-
-    # DEBUG: 檢查最終的 select_options 列表及其長度
-    print(f"DEBUG: Final select_options contents: {select_options}")
-    print(f"DEBUG: Number of options: {len(select_options)}")
-
-
-    # 處理沒有任何選項的情況（例如，雖然有魚竿但數據有問題導致選項未能成功生成）
-    if not select_options:
-        await interaction.response.send_message("❌ 無法建立魚竿選擇菜單。你的背包中沒有可用的魚竿選項，請檢查背包或聯繫管理員。", ephemeral=True)
-        return
-
-    if len(select_options) > 25: # Discord Select 選項上限是 25 個
-        await interaction.response.send_message("你的魚竿太多了，無法一次性顯示所有選項。請聯繫管理員。", ephemeral=True)
-        return
-
-    # 修正：RodSelectView 類別現在接受 options_list 作為參數
-    class RodSelectView(discord.ui.View):
-        def __init__(self, user_id, options_list): # <--- 這裡新增 options_list 參數
-            super().__init__(timeout=60)
-            self.user_id = user_id
-            self.add_item(
-                discord.ui.Select(
-                    placeholder="選擇你的魚竿...",
-                    options=options_list, # <--- 這裡使用傳入的 options_list
-                    custom_id="rod_select_menu"
-                )
-            )
-
-        async def interaction_check(self, interaction: discord.Interaction) -> bool:
-            if interaction.user.id != int(self.user_id):
-                await interaction.response.send_message("你不能操作別人的選單！", ephemeral=True)
-                return False
-            return True
-
-        @discord.ui.select(custom_id="rod_select_menu")
-        async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
-            user_data = get_user_data(self.user_id)
-            selected_rod = select.values[0]
-
-            if selected_rod in user_data['items'] and '魚竿' in selected_rod:
-                user_data['current_rod'] = selected_rod
-                await interaction.response.send_message(f"✅ 已切換到 **{selected_rod}**！", ephemeral=False)
-                self.stop()
-            else:
-                await interaction.response.send_message("❌ 無效的選擇或你沒有這個魚竿！", ephemeral=True)
-
-        async def on_timeout(self):
-            pass
-
-    # 實例化 RodSelectView 時，將 select_options 傳遞進去
-    view = RodSelectView(interaction.user.id, select_options) # <--- 這裡將 select_options 作為第二個參數傳入
-    await interaction.response.send_message("請選擇你要使用的魚竿：", view=view, ephemeral=True)
-
 
 @bot.tree.command(name='shop', description='查看商店裡可用的釣魚用品。')
 async def shop_command(interaction: discord.Interaction):
@@ -441,7 +378,7 @@ async def buy_command(interaction: discord.Interaction, item_name: str):
             item_info = info
             break
 
-    if not found_item_key or found_item_key == '基本魚竿': # 防止購買基本魚竿
+    if not found_item_key or found_item_key == '基本魚竿':
         await interaction.response.send_message(f"❌ 商店中沒有 **{item_name}** 這個物品。", ephemeral=True)
         return
 
@@ -521,7 +458,7 @@ async def save_command(interaction: discord.Interaction):
         f'{interaction.user.mention} 這是你的遊戲進度檔案。請妥善保存！\n'
         '**重要：** 此機器人版本不會自動保存進度。若要恢復，請使用 `/load` 指令。',
         file=discord_file,
-        ephemeral=True
+        ephemeral=True # 訊息只對使用者可見
     )
 
 @bot.tree.command(name='load', description='上傳你的遊戲進度 JSON 檔案，繼續之前的進度。')
