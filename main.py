@@ -116,14 +116,21 @@ def determine_fish_rarity(rare_bonus):
         rates['epic'] = rates.get('epic', 0) + boost_to_epic
         rates['rare'] = rates.get('rare', 0) + boost_to_rare
 
-        deductible_amount = (boost_to_legendary + boost_to_epic + boost_to_rare) - (rates['common'] + rates['rare'] + rates['epic'] + rates['legendary'] - sum(game_data['rarity_rates'].values()))
-        if deductible_amount > 0:
-            deduct_from_common = min(rates.get('common', 0), deductible_amount * 0.7)
-            rates['common'] = rates.get('common', 0) - deduct_from_common
-            deductible_amount -= deduct_from_common
+        # 確保總機率不超過 1，並從 Common 和 Junk 中扣除提升的機率
+        # 這裡的邏輯需要微調以確保總和為 1 且不會出現負機率
+        # 更穩健的做法是重新正規化所有機率
+        # 簡單處理：從 Common 和 Junk 中等比例扣除
+        deduct_sum = boost_to_legendary + boost_to_epic + boost_to_rare
+        if deduct_sum > 0:
+            total_remaining_common_junk = rates.get('common', 0) + rates.get('junk', 0)
+            if total_remaining_common_junk > 0:
+                deduct_from_common = deduct_sum * (rates.get('common', 0) / total_remaining_common_junk)
+                deduct_from_junk = deduct_sum * (rates.get('junk', 0) / total_remaining_common_junk)
 
-            deduct_from_junk = min(rates.get('junk', 0), deductible_amount)
-            rates['junk'] = rates.get('junk', 0) - deduct_from_junk
+                rates['common'] = max(0, rates.get('common', 0) - deduct_from_common)
+                rates['junk'] = max(0, rates.get('junk', 0) - deduct_from_junk)
+            else: # 如果 Common 和 Junk 都為 0，則無法扣除
+                pass # 保持現有機率
 
     for rarity in rates:
         rates[rarity] = max(0, rates[rarity])
@@ -133,6 +140,7 @@ def determine_fish_rarity(rare_bonus):
         for rarity in rates:
             rates[rarity] /= total_sum
     else:
+        # 如果所有機率都為 0，則預設為普通魚
         rates = {'common': 1.0}
 
     rand = random.random()
@@ -143,14 +151,12 @@ def determine_fish_rarity(rare_bonus):
         if rand <= cumulative:
             return rarity
 
-    return 'common'
+    return 'common' # Fallback in case something goes wrong
 
 # --- Discord 機器人事件 ---
 @bot.event
 async def on_ready():
     print(f'{bot.user} 已連線!')
-    # 不再自動載入遊戲資料，因為移除了檔案持久化
-
     try:
         synced_commands = await bot.tree.sync()
         print(f"已同步 {len(synced_commands)} 個斜線指令。")
@@ -293,7 +299,7 @@ async def fish_command(interaction: discord.Interaction):
 
     rarity = determine_fish_rarity(rare_bonus)
     if not game_data['fish_data'].get(rarity):
-        rarity = 'common'
+        rarity = 'common' # Fallback to common if rarity not found
     fish_name = random.choice(list(game_data['fish_data'][rarity].keys()))
     fish_info = game_data['fish_data'][rarity][fish_name]
 
@@ -327,7 +333,13 @@ async def fish_item_command(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     user_data = get_user_data(user_id)
 
+    # DEBUG: 檢查原始用戶道具數據
+    print(f"DEBUG: User {user_id} raw items: {user_data['items']}")
+
     rods = [item for item in user_data['items'] if '魚竿' in item]
+    # DEBUG: 檢查篩選後的魚竿列表
+    print(f"DEBUG: Filtered rods list: {rods}")
+
     if not rods:
         await interaction.response.send_message("❌ 你沒有任何魚竿可以切換！", ephemeral=True)
         return
@@ -335,23 +347,38 @@ async def fish_item_command(interaction: discord.Interaction):
     select_options = []
     for rod_name in rods:
         is_current = " (使用中)" if rod_name == user_data['current_rod'] else ""
+        description_text = game_data['items'].get(rod_name, {}).get('description', '')
+        # DEBUG: 檢查每個選項的構成
+        print(f"DEBUG: Creating option for rod '{rod_name}': label='{rod_name}{is_current}', value='{rod_name}', description='{description_text}'")
+
         select_options.append(
             discord.SelectOption(label=f"{rod_name}{is_current}", value=rod_name,
-                                 description=game_data['items'].get(rod_name, {}).get('description', ''))
+                                 description=description_text)
         )
 
-    if len(select_options) > 25:
+    # DEBUG: 檢查最終的 select_options 列表及其長度
+    print(f"DEBUG: Final select_options contents: {select_options}")
+    print(f"DEBUG: Number of options: {len(select_options)}")
+
+
+    # 處理沒有任何選項的情況（例如，雖然有魚竿但數據有問題導致選項未能成功生成）
+    if not select_options:
+        await interaction.response.send_message("❌ 無法建立魚竿選擇菜單。你的背包中沒有可用的魚竿選項，請檢查背包或聯繫管理員。", ephemeral=True)
+        return
+
+    if len(select_options) > 25: # Discord Select 選項上限是 25 個
         await interaction.response.send_message("你的魚竿太多了，無法一次性顯示所有選項。請聯繫管理員。", ephemeral=True)
         return
 
+    # 修正：RodSelectView 類別現在接受 options_list 作為參數
     class RodSelectView(discord.ui.View):
-        def __init__(self, user_id):
+        def __init__(self, user_id, options_list): # <--- 這裡新增 options_list 參數
             super().__init__(timeout=60)
             self.user_id = user_id
             self.add_item(
                 discord.ui.Select(
                     placeholder="選擇你的魚竿...",
-                    options=select_options,
+                    options=options_list, # <--- 這裡使用傳入的 options_list
                     custom_id="rod_select_menu"
                 )
             )
@@ -377,7 +404,8 @@ async def fish_item_command(interaction: discord.Interaction):
         async def on_timeout(self):
             pass
 
-    view = RodSelectView(interaction.user.id)
+    # 實例化 RodSelectView 時，將 select_options 傳遞進去
+    view = RodSelectView(interaction.user.id, select_options) # <--- 這裡將 select_options 作為第二個參數傳入
     await interaction.response.send_message("請選擇你要使用的魚竿：", view=view, ephemeral=True)
 
 
@@ -413,7 +441,7 @@ async def buy_command(interaction: discord.Interaction, item_name: str):
             item_info = info
             break
 
-    if not found_item_key or found_item_key == '基本魚竿':
+    if not found_item_key or found_item_key == '基本魚竿': # 防止購買基本魚竿
         await interaction.response.send_message(f"❌ 商店中沒有 **{item_name}** 這個物品。", ephemeral=True)
         return
 
@@ -493,7 +521,7 @@ async def save_command(interaction: discord.Interaction):
         f'{interaction.user.mention} 這是你的遊戲進度檔案。請妥善保存！\n'
         '**重要：** 此機器人版本不會自動保存進度。若要恢復，請使用 `/load` 指令。',
         file=discord_file,
-        ephemeral=True # 訊息只對使用者可見
+        ephemeral=True
     )
 
 @bot.tree.command(name='load', description='上傳你的遊戲進度 JSON 檔案，繼續之前的進度。')
@@ -501,7 +529,6 @@ async def save_command(interaction: discord.Interaction):
 async def load_command(interaction: discord.Interaction, file: discord.Attachment):
     user_id = str(interaction.user.id)
 
-    # 立即延遲回應，因為檔案讀取可能需要時間
     await interaction.response.defer(ephemeral=True)
 
     if not file.filename.lower().endswith('.json'):
@@ -509,12 +536,10 @@ async def load_command(interaction: discord.Interaction, file: discord.Attachmen
         return
 
     try:
-        # 從 Discord 附件讀取檔案內容
         file_content_bytes = await file.read()
         file_content_str = file_content_bytes.decode('utf-8')
         loaded_data = json.loads(file_content_str)
 
-        # 檢查載入的數據是否包含當前用戶的ID
         if user_id not in loaded_data:
             await interaction.followup.send(
                 "❌ 載入的檔案不包含你的遊戲進度！請確保上傳的是你自己的 `/save` 檔案。",
@@ -522,7 +547,6 @@ async def load_command(interaction: discord.Interaction, file: discord.Attachmen
             )
             return
 
-        # 更新當前用戶的遊戲數據
         game_data['users'][user_id] = loaded_data[user_id]
 
         loaded_player_data = game_data['users'][user_id]
@@ -533,7 +557,7 @@ async def load_command(interaction: discord.Interaction, file: discord.Attachmen
         await interaction.followup.send(
             f'✅ **{interaction.user.mention}** 你的遊戲進度已成功載入！\n'
             f'你現在有 **💰{coins}** 金錢，**🎣 {items_count}** 個道具，並釣過 **🐟 {fish_types_count}** 種魚。',
-            ephemeral=False # 這裡可以讓訊息公開，顯示玩家成功載入
+            ephemeral=False
         )
 
     except json.JSONDecodeError:
@@ -554,11 +578,6 @@ def home():
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy"})
-
-# 移除 /data 路由，因為不再建議公開所有資料
-# @app.route('/data')
-# def get_all_data():
-#     return jsonify(game_data)
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
